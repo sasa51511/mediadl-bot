@@ -1,0 +1,534 @@
+import os, re, sys, time, json, glob, shutil, tempfile, subprocess, html, threading
+import requests
+
+TOKEN = os.environ["BOT_TOKEN"]
+API = f"https://api.telegram.org/bot{TOKEN}"
+LIMIT = 49 * 1024 * 1024
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleTrust/537.36 Chrome/124 Safari/537.36".replace("AppleTrust", "AppleWebKit")
+COOKIES = os.environ.get("COOKIES_FILE", "cookies.txt")
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+# ---------- state: users, bans, stats (saved to state.json in the repo) ----------
+STATE_FILE = "state.json"
+LOCK = threading.Lock()
+STATE = {"users": {}, "banned": [], "ok": 0, "fail": 0, "by": {}}
+DIRTY = [False]
+PIN = [None]
+
+def admin_id():
+    v = os.environ.get("ADMIN_ID", "").strip()
+    if not v:
+        try: v = open("admin.txt").read().strip()
+        except Exception: v = ""
+    return int(v) if v.lstrip("-").isdigit() else None
+
+def load_state():
+    """state lives in a pinned message in the admin's private Telegram chat (never in the repo)"""
+    adm = admin_id()
+    if not adm: return
+    try:
+        r = requests.post(f"{API}/getChat", data={"chat_id": adm}, timeout=30).json()
+        pm = (r.get("result") or {}).get("pinned_message") or {}
+        t = pm.get("text") or ""
+        if t.startswith("STATE:"):
+            STATE.update(json.loads(t[6:])); PIN[0] = pm.get("message_id"); log("state loaded", len(STATE["users"]))
+    except Exception as e:
+        log("state load failed", e)
+
+def save_state_loop():
+    while True:
+        time.sleep(60)
+        if not DIRTY[0]: continue
+        DIRTY[0] = False
+        adm = admin_id()
+        if not adm: continue
+        try:
+            with LOCK:
+                st = dict(STATE)
+                users = sorted(st["users"].items(), key=lambda kv: kv[1].get("first", ""), reverse=True)
+                st["users"] = dict(users)
+                txt = "STATE:" + json.dumps(st, ensure_ascii=False, separators=(",", ":"))
+                while len(txt) > 3900 and st["users"]:
+                    st["users"].pop(list(st["users"])[-1]); txt = "STATE:" + json.dumps(st, ensure_ascii=False, separators=(",", ":"))
+            if PIN[0]:
+                r = tg("editMessageText", chat_id=adm, message_id=PIN[0], text=txt)
+                if r.get("ok") or "not modified" in str(r): continue
+            r = tg("sendMessage", chat_id=adm, text=txt, disable_notification="true")
+            if r.get("ok"):
+                PIN[0] = r["result"]["message_id"]
+                tg("pinChatMessage", chat_id=adm, message_id=PIN[0], disable_notification="true")
+        except Exception as e:
+            log("state save failed", e)
+
+def note_user(u, chat, what):
+    """register the user, tell the admin (name + id) about new users and every use"""
+    uid = str(u.get("id", chat))
+    name = ((u.get("first_name") or "") + " " + (u.get("last_name") or "")).strip() or "—"
+    un = ("@" + u["username"]) if u.get("username") else "بدون يوزر"
+    with LOCK:
+        new = uid not in STATE["users"]
+        rec = STATE["users"].setdefault(uid, {"name": name, "username": un, "n": 0, "first": time.strftime("%Y-%m-%d %H:%M")})
+        rec["name"], rec["username"] = name, un
+        rec["n"] += 1 if what != "start" else 0
+        DIRTY[0] = True
+    adm = admin_id()
+    if adm and int(uid) != adm:
+        kb = json.dumps({"inline_keyboard": [[{"text": "⛔ حظر المستخدم", "callback_data": "adm:ban:%s" % uid}]]})
+        if new: tg("sendMessage", chat_id=adm, text="🆕 مستخدم جديد\n👤 %s\n🔗 %s\n🆔 %s" % (name, un, uid), reply_markup=kb)
+        elif what != "start": tg("sendMessage", chat_id=adm, text="📥 %s (%s)\n🆔 %s\n%s" % (name, un, uid, what[:150]), reply_markup=kb)
+
+def is_banned(uid): return int(uid) in STATE["banned"]
+
+def count(kind, h=""):
+    with LOCK:
+        STATE["ok" if kind == "ok" else "fail"] += 1
+        if kind == "ok" and h: STATE["by"][h] = STATE["by"].get(h, 0) + 1
+        DIRTY[0] = True
+
+def tg(method, **kw):
+    files = kw.pop("files", None)
+    r = requests.post(f"{API}/{method}", data=kw, files=files, timeout=300)
+    try: return r.json()
+    except Exception: return {"ok": False}
+
+def say(chat, text, reply=None):
+    return tg("sendMessage", chat_id=chat, text=text, reply_to_message_id=reply or "", disable_web_page_preview="true")
+
+def host(url):
+    m = re.match(r"https?://([^/]+)", url); h = (m.group(1) if m else "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+WARP = [None]
+
+def setup_warp():
+    """free Cloudflare WARP socks proxy (wgcf + wireproxy) so YouTube sees a non-datacenter IP"""
+    try:
+        d = "/tmp/warp"; os.makedirs(d, exist_ok=True)
+        def sh(c): return subprocess.run(c, shell=True, cwd=d, capture_output=True, text=True, timeout=120)
+        sh("curl -sL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 && chmod +x wgcf")
+        sh("./wgcf register --accept-tos && ./wgcf generate")
+        sh("curl -sL https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz | tar xz")
+        open(d + "/wp.conf", "w").write(open(d + "/wgcf-profile.conf").read() + "\n[Socks5]\nBindAddress = 127.0.0.1:25344\n")
+        subprocess.Popen([d + "/wireproxy", "-c", d + "/wp.conf"], stdout=open(d + "/wp.log", "w"), stderr=subprocess.STDOUT)
+        time.sleep(4)
+        r = subprocess.run(["curl", "-s", "-m", "15", "-x", "socks5h://127.0.0.1:25344", "https://ifconfig.me"], capture_output=True, text=True)
+        if r.stdout.strip(): WARP[0] = "socks5://127.0.0.1:25344"; log("warp ok", r.stdout.strip())
+        else: log("warp failed")
+    except Exception as e:
+        log("warp error", e)
+
+def ytdlp(url, out, fmt, audio=False):
+    h = host(url)
+    if WARP[0] and ("youtube.com" in h or "youtu.be" in h):
+        err = ""
+        for cl in ("android_vr", "android", None):
+            ok, err = ytdlp1(url, out, fmt if audio else fmt + "/18/b", audio, WARP[0], cl)
+            if ok and files_in(out): return ok, err
+            for f in files_in(out):
+                try: os.remove(f)
+                except OSError: pass
+        return False, err
+    return ytdlp1(url, out, fmt, audio)
+
+def ytdlp1(url, out, fmt, audio=False, proxy=None, client=None):
+    cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "-f", fmt, "--merge-output-format", "mp4",
+           "--max-filesize", "400M", "-o", os.path.join(out, "%(id)s.%(ext)s"), "--socket-timeout", "30",
+           "--retries", "2"]
+    if not (proxy and "youtu" in url): cmd += ["--user-agent", UA]
+    if audio: cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "5"]
+    if os.path.exists(COOKIES): cmd += ["--cookies", COOKIES]
+    if proxy: cmd += ["--proxy", proxy]
+    if client: cmd += ["--extractor-args", "youtube:player_client=" + client]
+    cmd.append(url)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    return p.returncode == 0, (p.stderr or "")[-400:]
+
+def files_in(out):
+    return sorted(glob.glob(os.path.join(out, "*")), key=os.path.getmtime)
+
+def get(url, **kw):
+    return requests.get(url, headers={"User-Agent": UA}, timeout=40, **kw)
+
+def dl(url, path):
+    with get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for c in r.iter_content(1 << 20): f.write(c)
+
+# ---------- fallbacks (free public helpers) ----------
+def fb_tiktok(url, out):
+    r = requests.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1}, timeout=40).json()
+    d = r.get("data") or {}
+    if r.get("code") != 0 or not d: raise RuntimeError(r.get("msg", "tikwm failed"))
+    imgs = d.get("images")
+    if imgs:
+        for i, u in enumerate(imgs[:10]): dl(u, os.path.join(out, f"img{i}.jpg"))
+        return
+    for key in ("hdplay", "play"):
+        u = d.get(key)
+        if u:
+            dl(u, os.path.join(out, "tiktok.mp4"))
+            if os.path.getsize(os.path.join(out, "tiktok.mp4")) <= LIMIT: return
+    raise RuntimeError("tiktok too big or empty")
+
+def fb_twitter(url, out):
+    m = re.search(r"(?:x|twitter)\.com/([^/]+)/status/(\d+)", url)
+    if not m: raise RuntimeError("no tweet id")
+    j = get(f"https://api.fxtwitter.com/{m.group(1)}/status/{m.group(2)}").json()
+    t = j.get("tweet") or {}
+    media = (t.get("media") or {}).get("all") or []
+    if not media: raise RuntimeError("no media in tweet")
+    for i, md in enumerate(media[:10]):
+        u = md.get("url")
+        dl(u, os.path.join(out, f"tw{i}." + ("mp4" if md.get("type") in ("video", "gif") else "jpg")))
+
+PIPED = ["https://api.piped.private.coffee", "https://pipedapi.kavin.rocks", "https://pipedapi.reallyaweso.me",
+         "https://pipedapi.darkness.services", "https://api.piped.yt"]
+
+def piped(path):
+    last = None
+    for h in PIPED:
+        try:
+            r = get(h + path)
+            if r.status_code == 200: return r.json()
+        except Exception as e: last = e
+    raise RuntimeError("piped down: %s" % last)
+
+def yt_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([\w-]{11})", url)
+    return m.group(1) if m else None
+
+def size_of(u):
+    try:
+        return int(requests.head(u, headers={"User-Agent": UA}, timeout=20, allow_redirects=True).headers.get("content-length") or 0)
+    except Exception: return 0
+
+def fb_youtube(url, out, vid=None):
+    vid = vid or yt_id(url)
+    if not vid: raise RuntimeError("no video id")
+    d = piped("/streams/" + vid)
+    vs = [x for x in d.get("videoStreams", []) if x.get("format") in ("MPEG_4", "MP4")]
+    muxed = sorted([x for x in vs if not x.get("videoOnly")], key=lambda x: x.get("height") or 0, reverse=True)
+    vonly = sorted([x for x in vs if x.get("videoOnly") and "avc" in (x.get("codec") or "")], key=lambda x: x.get("height") or 0, reverse=True)
+    aud = sorted([x for x in d.get("audioStreams", []) if x.get("format") in ("M4A", "MPEG_4")], key=lambda x: x.get("bitrate") or 0, reverse=True)
+    dur = d.get("duration") or 0
+    p = os.path.join(out, "yt.mp4")
+    # better quality: separate video + audio merged with ffmpeg (only when short enough to fit)
+    if vonly and aud and dur and dur <= 600:
+        for v in vonly:
+            h = v.get("height") or 0
+            if h > 720: continue
+            est = (v.get("bitrate") or 0) * dur / 8 + (aud[0].get("bitrate") or 0) * dur / 8
+            if est > LIMIT * 0.9: continue
+            try:
+                dl(v["url"], os.path.join(out, "v.mp4")); dl(aud[0]["url"], os.path.join(out, "a.m4a"))
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.join(out, "v.mp4"), "-i", os.path.join(out, "a.m4a"),
+                                "-c", "copy", "-movflags", "+faststart", p], check=True, timeout=300)
+                os.remove(os.path.join(out, "v.mp4")); os.remove(os.path.join(out, "a.m4a"))
+                if os.path.getsize(p) <= LIMIT: return
+                os.remove(p)
+            except Exception as e:
+                log("merge failed", e)
+                for n in ("v.mp4", "a.m4a", "yt.mp4"):
+                    try: os.remove(os.path.join(out, n))
+                    except OSError: pass
+    for x in muxed:
+        dl(x["url"], p)
+        if os.path.getsize(p) <= LIMIT: return
+        os.remove(p)
+    raise RuntimeError("no stream small enough")
+
+def yt_search(q, n=5):
+    d = piped("/search?q=%s&filter=videos" % requests.utils.quote(q))
+    res = []
+    for i in d.get("items", []):
+        v = yt_id(i.get("url", ""))
+        if v and not i.get("isShort") is None:
+            res.append((v, i.get("title", "")[:60], i.get("duration") or 0))
+        if len(res) >= n: break
+    return res
+
+def to_mp3(out):
+    for f in files_in(out):
+        if f.endswith(".mp4"):
+            m = f[:-4] + ".mp3"
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", f, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", m], check=True, timeout=300)
+            os.remove(f)
+
+def fb_og(url, out):
+    """last resort: pull the main image/video from the page's og: tags (works for many photo posts, Pinterest images)"""
+    t = get(url).text
+    for prop in ("og:video", "og:video:url", "og:image"):
+        m = re.search(r'<meta[^>]+property=["\']%s["\'][^>]+content=["\']([^"\']+)' % prop, t) or \
+            re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']%s["\']' % prop, t)
+        if m:
+            u = html.unescape(m.group(1))
+            if u.startswith("http"):
+                dl(u, os.path.join(out, "page." + ("mp4" if "video" in prop else "jpg"))); return
+    raise RuntimeError("nothing found")
+
+def fetch(url, out, quality="high", audio=False):
+    h = host(url)
+    errs = []
+    if audio:
+        ok, err = ytdlp(url, out, "ba/b", True)
+        if ok and files_in(out): return
+        errs.append(err)
+    # 1) yt-dlp (best quality that fits Telegram's 50MB bot limit)
+    fmts = ("b[height<=360][filesize<48M]/w[filesize<48M]", "w") if quality == "small" else \
+           ("b[filesize<48M]/bv*[filesize<40M]+ba/b[height<=720]/b", "w")
+    for fmt in fmts:
+        if audio: break
+        ok, err = ytdlp(url, out, fmt)
+        if ok and files_in(out) and all(os.path.getsize(f) <= LIMIT for f in files_in(out)): return
+        errs.append(err)
+        for f in files_in(out):
+            if os.path.getsize(f) > LIMIT: os.remove(f)
+    # 2) site-specific free fallbacks
+    fbs = []
+    if "tiktok.com" in h: fbs.append(fb_tiktok)
+    if h in ("x.com", "twitter.com", "mobile.twitter.com"): fbs.append(fb_twitter)
+    if "youtube.com" in h or "youtu.be" in h: fbs.append(fb_youtube)
+    fbs.append(fb_og)
+    for f in fbs:
+        try:
+            f(url, out)
+            if files_in(out): return
+        except Exception as e:
+            errs.append(f"{f.__name__}: {e}")
+    raise RuntimeError(" | ".join(errs)[-500:])
+
+def send_files(chat, out, reply):
+    fs = files_in(out)
+    imgs = [f for f in fs if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+    vids = [f for f in fs if f not in imgs]
+    for f in vids:
+        ext = f.lower().rsplit(".", 1)[-1]
+        method, field = ("sendVideo", "video") if ext in ("mp4", "mov", "m4v", "webm") else \
+                        ("sendAudio", "audio") if ext in ("mp3", "m4a") else ("sendDocument", "document")
+        with open(f, "rb") as fh:
+            r = tg(method, chat_id=chat, reply_to_message_id=reply, supports_streaming="true", files={field: fh})
+        if not r.get("ok"):
+            with open(f, "rb") as fh:
+                r = tg("sendDocument", chat_id=chat, reply_to_message_id=reply, files={"document": fh})
+        if not r.get("ok"): raise RuntimeError("telegram upload failed: " + str(r.get("description")))
+    for f in imgs[:10]:
+        with open(f, "rb") as fh:
+            r = tg("sendPhoto", chat_id=chat, reply_to_message_id=reply, files={"photo": fh})
+        if not r.get("ok"):
+            with open(f, "rb") as fh:
+                tg("sendDocument", chat_id=chat, reply_to_message_id=reply, files={"document": fh})
+
+YT_OFF = "🚫 يوتيوب مش متاح دلوقتي\nتيك توك • إنستجرام • فيسبوك • تويتر/X • بنترست شغالين، ابعتلي رابط منهم."
+
+def handle(chat, mid, url, late=False, audio=False, vid=None, quality="high"):
+    if vid or is_yt(url):
+        say(chat, YT_OFF, mid); return
+    tg("sendChatAction", chat_id=chat, action="upload_video")
+    out = tempfile.mkdtemp(prefix="dl_")
+    try:
+        if late: say(chat, "⏳ سامحني على التأخير، البوت كان بيعيد تشغيل نفسه. بحمّلها دلوقتي...", mid)
+        if vid: fb_youtube("", out, vid)
+        else: fetch(url, out, quality, audio)
+        if audio: to_mp3(out)
+        send_files(chat, out, mid)
+        log("ok", url[:120]); count("ok", host(url) if url else "youtube.com")
+    except Exception as e:
+        log("FAIL", url[:120], str(e)[:300]); count("fail")
+        if vid or "youtu" in url:
+            say(chat, "يوتيوب بيرفض التحميل من السيرفرات المجانية أغلب الوقت 😕\nجرب تاني بعد شوية أو جرب فيديو تاني. (تيك توك وتويتر وبنترست وفيسبوك شغالين أحسن)", mid)
+        else:
+            say(chat, "معرفتش أنزل الرابط ده 😕\nممكن يكون الفيديو خاص أو الموقع رافض التحميل (إنستجرام أوقات بيطلب تسجيل دخول). جرب رابط تاني.", mid)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+def do_search(chat, mid, q):
+    try:
+        res = yt_search(q)
+    except Exception:
+        say(chat, "البحث في يوتيوب مش شغال دلوقتي 😕 جرب كمان شوية أو ابعتلي الرابط على طول.", mid); return
+    if not res:
+        say(chat, "ملقتش حاجة بالاسم ده. جرب كلمات تانية.", mid); return
+    kb = []
+    for v, t, d in res:
+        kb.append([{"text": "🎬 %s · %d:%02d" % (t, d // 60, d % 60), "callback_data": "v:" + v},
+                   {"text": "🎧 MP3", "callback_data": "a:" + v}])
+    tg("sendMessage", chat_id=chat, reply_to_message_id=mid,
+       text="🔎 نتائج البحث\nاضغط 🎬 للفيديو أو 🎧 للصوت MP3:",
+       reply_markup=json.dumps({"inline_keyboard": kb}))
+
+PENDING = {}
+
+def is_yt(url): 
+    h = host(url); return "youtube.com" in h or h == "youtu.be"
+
+def offer_youtube(chat, mid, url):
+    say(chat, YT_OFF, mid); return
+    tok = "%x" % (abs(hash((url, time.time()))) % (1 << 40)); PENDING[tok] = url
+    if len(PENDING) > 300: PENDING.pop(next(iter(PENDING)))
+    if ("list=" in url or "/playlist" in url) and not re.search(r"[?&]v=|youtu\.be/", url):
+        rows = [[{"text": "📚 تحميل الكل فيديو", "callback_data": "pl:%s:v" % tok}],
+                [{"text": "🎧 تحميل الكل صوت MP3", "callback_data": "pl:%s:a" % tok}]]
+        txt = "📚 ده بلاي ليست\nاختار طريقة التحميل (لحد 10 فيديوهات):"
+    else:
+        rows = [[{"text": "🎬 جودة عالية", "callback_data": "q:%s:h" % tok}, {"text": "📱 حجم صغير", "callback_data": "q:%s:s" % tok}],
+                [{"text": "🎧 صوت فقط MP3", "callback_data": "q:%s:a" % tok}]]
+        txt = "🎞 اختار طريقة التحميل:"
+    tg("sendMessage", chat_id=chat, reply_to_message_id=mid, text=txt, reply_markup=json.dumps({"inline_keyboard": rows}))
+
+def playlist(chat, mid, url, audio):
+    say(chat, YT_OFF, mid); return
+    p = subprocess.run(["yt-dlp", "--flat-playlist", "-J", "--no-warnings", url], capture_output=True, text=True, timeout=120)
+    try: ids = [e["id"] for e in json.loads(p.stdout).get("entries", []) if e.get("id")][:10]
+    except Exception: ids = []
+    if not ids:
+        say(chat, "معرفتش أقرا البلاي ليست دي 😕 (يوتيوب بيرفض من السيرفر المجاني أغلب الوقت)", mid); return
+    say(chat, "تمام، هنزّل %d فيديو واحد ورا التاني ⏳" % len(ids), mid)
+    for v in ids:
+        handle(chat, mid, "https://www.youtube.com/watch?v=" + v, False, audio, None, "high")
+
+def stats_text():
+    with LOCK:
+        top = sorted(STATE["by"].items(), key=lambda x: -x[1])[:6]
+        return "📊 الإحصائيات\n👥 المستخدمين: %d\n⛔ المحظورين: %d\n✅ تحميلات ناجحة: %d\n❌ فاشلة: %d\n\n%s" % (
+            len(STATE["users"]), len(STATE["banned"]), STATE["ok"], STATE["fail"],
+            "\n".join("%s: %d" % kv for kv in top) or "—")
+
+AWAIT = [None]
+
+def kbd(rows): return json.dumps({"inline_keyboard": rows})
+
+def panel(chat):
+    kb = [[{"text": "📊 الإحصائيات", "callback_data": "adm:stats"}, {"text": "👥 المستخدمين", "callback_data": "adm:users"}],
+          [{"text": "⛔ حظر بالـ ID", "callback_data": "adm:askban"}, {"text": "✅ فك حظر بالـ ID", "callback_data": "adm:askunban"}],
+          [{"text": "🚫 قائمة المحظورين", "callback_data": "adm:banned"}]]
+    tg("sendMessage", chat_id=chat, text="🛠 لوحة التحكم\nاختار من الأزرار 👇", reply_markup=kbd(kb))
+
+def users_view(chat):
+    with LOCK:
+        rows = sorted(STATE["users"].items(), key=lambda kv: kv[1].get("first", ""), reverse=True)[:15]
+    if not rows: say(chat, "مفيش مستخدمين لسه"); return
+    kb = []
+    for k, v in rows:
+        bn = int(k) in STATE["banned"]
+        kb.append([{"text": "%s %s %s (%d)" % ("⛔" if bn else "👤", v["name"][:18], v["username"], v["n"]),
+                    "callback_data": "adm:%s:%s" % ("unban" if bn else "ban", k)}])
+    tg("sendMessage", chat_id=chat, text="👥 آخر المستخدمين\nاضغط على أي واحد لحظره أو فك حظره", reply_markup=kbd(kb))
+
+def admin_cb(chat, data):
+    parts = data.split(":")
+    AWAIT[0] = None
+    if parts[1] == "stats": say(chat, stats_text()); panel(chat)
+    elif parts[1] == "users": users_view(chat)
+    elif parts[1] in ("askban", "askunban"):
+        AWAIT[0] = parts[1][3:]
+        say(chat, "ابعتلي الـ ID بتاع المستخدم (أرقام بس) 🔢")
+    elif parts[1] == "banned":
+        with LOCK: ids = list(STATE["banned"])
+        if not ids: say(chat, "✅ مفيش حد محظور")
+        for i in ids:
+            u = STATE["users"].get(str(i), {})
+            tg("sendMessage", chat_id=chat, text="⛔ %s %s\nID: %s" % (u.get("name", ""), u.get("username", ""), i),
+               reply_markup=kbd([[{"text": "✅ فك الحظر", "callback_data": "adm:unban:%s" % i}]]))
+    elif parts[1] in ("ban", "unban") and len(parts) > 2: admin_cmd(chat, "/%s %s" % (parts[1], parts[2]))
+
+def admin_cmd(chat, text):
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lower()
+    if cmd == "/stats": say(chat, stats_text())
+    elif cmd in ("/ban", "/unban") and len(parts) > 1 and parts[1].lstrip("-").isdigit():
+        uid = int(parts[1])
+        with LOCK:
+            if cmd == "/ban" and uid not in STATE["banned"]: STATE["banned"].append(uid)
+            if cmd == "/unban" and uid in STATE["banned"]: STATE["banned"].remove(uid)
+            DIRTY[0] = True
+        say(chat, ("⛔ اتحظر " if cmd == "/ban" else "✅ اتفك الحظر عن ") + str(uid)); panel(chat)
+    elif cmd == "/users":
+        with LOCK:
+            rows = sorted(STATE["users"].items(), key=lambda kv: kv[1].get("first", ""), reverse=True)[:25]
+        say(chat, "\n".join("%s | %s | %s | %d طلب%s" % (k, v["name"], v["username"], v["n"], " ⛔" if int(k) in STATE["banned"] else "") for k, v in rows) or "مفيش مستخدمين لسه")
+    else:
+        panel(chat)
+
+WELCOME = ("أهلاً بيك! 👋\nابعتلي رابط فيديو أو صورة من:\nتيك توك • إنستجرام • يوتيوب • تويتر/X • فيسبوك • بنترست\n"
+           "وأنا أرجعهولك ملف تحميل على طول.\n🔎 ولو كتبتلي اسم أغنية أو فيديو (من غير رابط) هدورلك عليه في يوتيوب.")
+
+def main():
+    me = tg("getMe"); log("bot:", me.get("result", {}).get("username"))
+    tg("deleteWebhook")
+    load_state()
+    threading.Thread(target=save_state_loop, daemon=True).start()
+    deadline = time.time() + int(os.environ.get("RUN_SECONDS", "0") or 10**9)
+    off = None
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{API}/getUpdates", params={"timeout": 50, "offset": off or "", "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=70).json()
+        except Exception as e:
+            log("poll error", e); time.sleep(5); continue
+        for u in r.get("result", []):
+            off = u["update_id"] + 1
+            cq = u.get("callback_query")
+            if cq:
+                tg("answerCallbackQuery", callback_query_id=cq["id"])
+                kind, _, vid = (cq.get("data") or "").partition(":")
+                msg = cq.get("message") or {}
+                chat = (msg.get("chat") or {}).get("id")
+                if not chat: continue
+                if kind == "adm":
+                    if (cq.get("from") or {}).get("id") == admin_id(): admin_cb(chat, cq.get("data") or "adm:x:")
+                    continue
+                if is_banned((cq.get("from") or {}).get("id", chat)): continue
+                if kind in ("q", "pl"):
+                    tok, _, mode = vid.partition(":")
+                    url = PENDING.get(tok)
+                    if not url:
+                        say(chat, "الطلب ده قديم، ابعت الرابط تاني 🙏"); continue
+                    note_user(cq.get("from") or {}, chat, "%s (%s)" % (url, mode))
+                    if kind == "pl":
+                        threading.Thread(target=playlist, args=(chat, msg.get("message_id"), url, mode == "a"), daemon=True).start()
+                    else:
+                        threading.Thread(target=handle, args=(chat, msg.get("message_id"), url, False, mode == "a", None, "small" if mode == "s" else "high"), daemon=True).start()
+                    continue
+                if chat and re.fullmatch(r"[\w-]{11}", vid):
+                    note_user(cq.get("from") or {}, chat, "يوتيوب " + vid)
+                    threading.Thread(target=handle, args=(chat, msg.get("message_id"), "", False, kind == "a", vid), daemon=True).start()
+                continue
+            m = u.get("message") or {}
+            text = (m.get("text") or m.get("caption") or "").strip()
+            chat = (m.get("chat") or {}).get("id")
+            if not chat or not text: continue
+            late = time.time() - m.get("date", time.time()) > 120
+            frm = m.get("from") or {"id": chat}
+            adm = admin_id()
+            if text.lower().startswith("/myid"):
+                say(chat, "الـ ID بتاعك: %s" % frm.get("id", chat), m.get("message_id")); continue
+            if adm and chat == adm and AWAIT[0] and text.lstrip("-").isdigit():
+                k = AWAIT[0]; AWAIT[0] = None
+                admin_cmd(chat, "/%s %s" % (k, text)); continue
+            if adm and chat == adm and text.startswith("/") and not text.lower().startswith("/help"):
+                AWAIT[0] = None
+                say(chat, WELCOME); panel(chat)
+                continue
+            if text.startswith("/") and not text.lower().startswith(("/start", "/help")):
+                say(chat, WELCOME, m.get("message_id")); continue
+            if is_banned(frm.get("id", chat)):
+                say(chat, "⛔ انت محظور من استخدام البوت.", m.get("message_id")); continue
+            urls = URL_RE.findall(text)
+            if urls:
+                note_user(frm, chat, urls[0])
+                for url in urls[:3]:
+                    url = url.rstrip(").,")
+                    if is_yt(url): offer_youtube(chat, m.get("message_id"), url)
+                    else: threading.Thread(target=handle, args=(chat, m.get("message_id"), url, late), daemon=True).start()
+            elif text.startswith("/start") or text.startswith("/help"):
+                note_user(frm, chat, "start")
+                say(chat, WELCOME, m.get("message_id"))
+            elif len(text) >= 2:
+                note_user(frm, chat, "بحث: " + text)
+                threading.Thread(target=do_search, args=(chat, m.get("message_id"), text), daemon=True).start()
+    time.sleep(20)  # let running downloads finish before exit
+
+if __name__ == "__main__":
+    main()
